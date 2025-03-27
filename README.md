@@ -1,3 +1,13 @@
+To run the nof1 trading sim, install this repo from source using a pip venv. If the nof1-trading-sim is a sibling of this directory, for example, then:
+```
+ln -s ../nof1-trading-sim/data data
+```
+
+Then 
+```
+python demo.py --env trade_sim
+```
+
 ![figure](https://pufferai.github.io/source/resource/header.png)
 
 [![PyPI version](https://badge.fury.io/py/pufferlib.svg)](https://badge.fury.io/py/pufferlib)

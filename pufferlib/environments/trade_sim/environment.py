@@ -3,15 +3,15 @@ import numpy as np
 
 import pufferlib
 
-from src.simulation.env import TradingEnvironment
+from nof1.simulation.env import TradingEnvironment
 
 def env_creator(name='metta'):
     return functools.partial(make, name)
 
-def make(name, config_path='trade_sim/config/experiment_config.yaml', render_mode='human', buf=None):
+def make(name, config_path='pufferlib/environments/trade_sim/config/experiment_config.yaml', render_mode='human', buf=None):
     '''Crafter creation function'''
-    from src.utils.config_manager import ConfigManager
-    from src.data_ingestion.historical_data_reader import HistoricalDataReader
+    from nof1.utils.config_manager import ConfigManager
+    from nof1.data_ingestion.historical_data_reader import HistoricalDataReader
 
     config_manager = ConfigManager(config_path)
     config = config_manager.config
