@@ -8,18 +8,28 @@ from nof1.simulation.env import TradingEnvironment
 def env_creator(name='metta'):
     return functools.partial(make, name)
 
-def make(name, config_path='pufferlib/environments/trade_sim/config/experiment_config.yaml', render_mode='human', buf=None):
-    '''Crafter creation function'''
+def make(name, config_path='../nof1-trading-sim/config/experiment_config_3.yaml', render_mode='human', buf=None):
+    '''nof1 env creation function'''
     from nof1.utils.config_manager import ConfigManager
     from nof1.data_ingestion.historical_data_reader import HistoricalDataReader
 
     config_manager = ConfigManager(config_path)
     config = config_manager.config
+    data_path = config['data']['historical']['data_path']
+    config['data']['historical']['data_path'] = '../nof1-trading-sim/' + data_path
+
+    # Load and preprocess data
     data_reader = HistoricalDataReader(config_manager)
-    data, _ = data_reader.preprocess_data()
+    states, prices, atrs, timestamps = data_reader.preprocess_data()
     
     # Create environment
-    env = TradingEnvironmentPuff(config_manager.config, data)
+    env = TradingEnvironment(config_manager.config, states = states, prices=prices, atrs=atrs, timestamps=timestamps)
+
+    # data_reader = HistoricalDataReader(config_manager)
+    # data, _ = data_reader.preprocess_data()
+    
+    # # Create environment
+    # env = TradingEnvironmentPuff(config_manager.config, data)
     return pufferlib.emulation.GymnasiumPufferEnv(env, buf=buf)
 
 class TradingEnvironmentPuff(TradingEnvironment):
@@ -28,6 +38,7 @@ class TradingEnvironmentPuff(TradingEnvironment):
 
     def reset(self):
         obs, info = super().reset()
+        breakpoint()
         return obs.astype(np.float32), info
 
     def step(self, action):
@@ -35,6 +46,7 @@ class TradingEnvironmentPuff(TradingEnvironment):
 
         if not terminated and not truncated:
             info = {}
+        breakpoint()
 
         return obs.astype(np.float32), reward, terminated, truncated, info
 

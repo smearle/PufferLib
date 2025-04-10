@@ -1,9 +1,11 @@
+import copy
 import functools
+
 import gym
 import numpy as np
+import torch
 
 import pufferlib
-
 from stonks_discrete.stonks import StonksEnv, N_ACTIONS
 
 N_STACK = 10
@@ -30,13 +32,20 @@ class StonksPuff(StonksEnv):
         # Take up to n_stack most recent prices
         price_hist = price_hist[-self.n_stack:]
         # Pad with earliest price if less than n_stack
-        price_hist = np.pad(price_hist, (self.n_stack - len(price_hist), 0), mode='constant', constant_values=price_hist[0])
+        if len(price_hist) < self.n_stack:
+            # Get the earliest price and use it for padding
+            earliest_price = price_hist[0]
+            # Create padding of the correct size
+            padding = [earliest_price] * (self.n_stack - len(price_hist))
+            # Prepend the padding to the price history
+            price_hist = np.array(padding + price_hist.tolist())
+        obs = copy.copy(obs)
         obs['price_history'] = price_hist
-        obs = np.array(obs.values())
+        obs = np.concatenate([np.array(a, dtype=np.float32).flatten() for a in list(obs.values())])
         obs = obs.flatten()
         return obs
 
-    def reset(self, seed):
+    def reset(self, seed=None):
         state = super().reset()
         self.state = state
         obs = self._get_obs(state)
@@ -44,7 +53,7 @@ class StonksPuff(StonksEnv):
         return obs, info
 
     def step(self, action):
-        state, reward, done = super().step(self.state, action)
+        state, reward, done = super().step(self.state, torch.Tensor(action))
         self.state = state
         obs = self._get_obs(state)
         terminated = done

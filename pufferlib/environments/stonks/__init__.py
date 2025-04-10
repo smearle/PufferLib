@@ -1,7 +1,7 @@
 from .environment import env_creator, make
 
 try:
-    import torch
+    import pufferlib.environments.stonks.torch as torch
 except ImportError:
     pass
 else:
