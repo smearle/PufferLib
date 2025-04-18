@@ -8,13 +8,14 @@ from nof1.simulation.env import TradingEnvironment
 def env_creator(name='metta'):
     return functools.partial(make, name)
 
-def make(name, config_path='../nof1-trading-sim/config/experiment_config_3.yaml', render_mode='human', buf=None):
+def make(name, config_path='../nof1-trading-sim/config/experiment_config_3.yaml', live_plot=False, render_mode='human', buf=None):
     '''nof1 env creation function'''
     from nof1.utils.config_manager import ConfigManager
     from nof1.data_ingestion.historical_data_reader import HistoricalDataReader
 
     config_manager = ConfigManager(config_path)
     config = config_manager.config
+    config['simulation']['live_plot'] = live_plot
     data_path = config['data']['historical']['data_path']
     config['data']['historical']['data_path'] = '../nof1-trading-sim/' + data_path
 
