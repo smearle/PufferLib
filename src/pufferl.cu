@@ -1187,6 +1187,11 @@ static void* vec_thread_main(void* arg) {
             }
             memset(&vec->rewards[agent_start], 0, apb * sizeof(float));
             memset(&vec->terminals[agent_start], 0, apb * sizeof(float));
+#ifdef PUFFER_T2
+            if (pufferl->t2) {
+                t2_capture_overflow(pufferl->t2, vec->actions, agent_start, apb);
+            }
+#endif
             clock_gettime(CLOCK_MONOTONIC, &t0);
             #pragma omp parallel for schedule(static) num_threads(vec->num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {

@@ -112,6 +112,14 @@ struct T2Grads {
     Prec tok_embed, act_embed, w_in, gru[T2_MAX_LAYERS], role, w_h, pos_embed, w_out;
 };
 
+// Active steps beyond the GPU replay-prefix capacity. Raw CPU records allow
+// exact current-weight scoring carries without an unbounded GPU state history.
+struct T2Overflow {
+    unsigned char* tok;
+    int* act;
+    size_t len, capacity;
+};
+
 struct T2 {
     // Config
     int A;                    // total agents (lanes)
@@ -151,6 +159,7 @@ struct T2 {
     Prec ep_state;            // (A, M, Lg, H) state after each recorded step
     Int ep_len;               // (A,) device copy of the recorded length
     int* host_len;            // mirror
+    T2Overflow* overflow;     // (A,) CPU suffix after the first M recorded steps
     int* host_episode;        // resets seen per lane (episode index)
     unsigned char* host_tok;  // pinned (A, L) tokens written by env workers
     Prec rewards;             // (slots * T, A) intrinsic rewards per rollout row
@@ -164,6 +173,7 @@ struct T2 {
     int* res_len;             // host (C,) 0 = empty
     int* res_pair;            // host (C,) pair id
     int* res_episode;         // host (C,) episode index
+    pthread_mutex_t reservoir_mutex; // terminal workers share reservoir metadata/copies
     long pairs_seen;
     long episodes_complete;
 
@@ -601,9 +611,15 @@ __global__ void t2_record_kernel(unsigned char* __restrict__ ep_tok,
             ep_act[((long)a * M + len) * heads + k] = act[(long)b * heads + k];
         }
     }
-    if (k == 0) {
-        ep_len[a] = terminals[b] != 0.0f ? 0 : (len < M ? len + 1 : len);
-    }
+}
+
+// Kernel boundary: all record writers must finish reading the old length
+// before any thread publishes the next length (warps/blocks are independent).
+__global__ void t2_advance_record_lengths(int* ep_len,const float* terminals,
+        int start,int B,int M) {
+    int b=blockIdx.x*blockDim.x+threadIdx.x;if(b>=B)return;
+    int a=start+b,len=ep_len[a];
+    ep_len[a]=terminals[b]!=0.0f?0:min(len+1,M);
 }
 
 // Rollout actions (B, heads) as ints; heads a verb does not consume read as
@@ -742,6 +758,47 @@ static unsigned int t2_rand(T2* t2) {
     return (unsigned int)(puf_t2_mix(++t2->rng) >> 33);
 }
 
+// Called after actions reach the CPU and before the environment can mutate
+// them or replace the current observation. Each worker owns disjoint lanes.
+static void t2_capture_overflow(T2* t2, const float* actions, int start, int count) {
+    if (!t2->reencode) return;
+#ifdef PUFFER_NETHACK
+    int verbs = 0, heads = 0;
+    const signed char* consumed = env_head_consume_map(&verbs, &heads);
+    assert(!consumed || (heads == t2->heads && verbs == t2->act_sizes[0]));
+#endif
+    for (int a = start; a < start + count; a++) {
+        if (t2->host_len[a] < t2->M) continue;
+        T2Overflow* tail = &t2->overflow[a];
+        if (tail->len == tail->capacity) {
+            size_t capacity = tail->capacity ? 2 * tail->capacity : (size_t)t2->M;
+            assert(capacity > tail->capacity
+                && capacity <= SIZE_MAX / (size_t)t2->L
+                && capacity <= SIZE_MAX / ((size_t)t2->heads * sizeof(int))
+                && "T2 active history capacity overflow");
+            unsigned char* tok = (unsigned char*)realloc(tail->tok, capacity * t2->L);
+            int* act = (int*)realloc(tail->act, capacity * t2->heads * sizeof(int));
+            assert(tok && act && "T2 active history allocation failed");
+            tail->tok = tok;
+            tail->act = act;
+            tail->capacity = capacity;
+        }
+        memcpy(tail->tok + tail->len * t2->L,
+            t2->host_tok + (long)a * t2->L, t2->L);
+        for (int h = 0; h < t2->heads; h++) {
+            int action = (int)actions[(long)a * t2->heads + h];
+#ifdef PUFFER_NETHACK
+            int verb = (int)actions[(long)a * t2->heads];
+            if (h != 0 && consumed && !consumed[verb * heads + h]) {
+                action = t2->act_sizes[h];
+            }
+#endif
+            tail->act[tail->len * t2->heads + h] = action;
+        }
+        tail->len++;
+    }
+}
+
 static double t2_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -822,6 +879,7 @@ void t2_rollout_step(PuffeRL* p, int buf, int t, cudaStream_t stream) {
         t2->ep_tok.data, t2->ep_act.data, t2->ep_state.data, t2->ep_len.data,
         t2->out_last.data, r->tok_cur.data, r->act.data, t2->state.data, r->out.data,
         term, agent0, B, t2->A, t2->L, t2->M, Lg, H, heads);
+    t2_advance_record_lengths<<<grid_size(B),BLOCK_SIZE,0,stream>>>(t2->ep_len.data,term,agent0,B,t2->M);
     for (int l = 0; l < Lg; l++) {
         t2_reset_states_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
             t2->state.data + ((long)l * t2->A + agent0) * H,
@@ -858,6 +916,14 @@ void t2_episode_bookkeeping(PuffeRL* p, int buf, cudaStream_t stream) {
     VecEnv* vec = p->vec;
     int B = t2->A / t2->num_buffers;
     int agent0 = buf * B;
+    bool terminal=false;
+    for(int a=agent0;a<agent0+B;a++)terminal|=vec->terminals[a]!=0.0f;
+    if(!terminal) {
+        // Lane counters are disjoint across workers; ordinary steps need no lock.
+        for(int a=agent0;a<agent0+B;a++)t2->host_len[a]=min(t2->host_len[a]+1,t2->M);
+        return;
+    }
+    pthread_mutex_lock(&t2->reservoir_mutex);
     for (int a = agent0; a < agent0 + B; a++) {
         int len = t2->host_len[a] < t2->M ? t2->host_len[a] + 1 : t2->M;
         if (vec->terminals[a] == 0.0f) {
@@ -866,6 +932,9 @@ void t2_episode_bookkeeping(PuffeRL* p, int buf, cudaStream_t stream) {
         }
         int episode = t2->host_episode[a]++;
         t2->host_len[a] = 0;
+        free(t2->overflow[a].tok);
+        free(t2->overflow[a].act);
+        t2->overflow[a] = (T2Overflow){};
         t2->episodes_complete++;
         if (len < 2) {
             continue;  // needs at least one successor
@@ -910,6 +979,10 @@ void t2_episode_bookkeeping(PuffeRL* p, int buf, cudaStream_t stream) {
             t2->out_last.data + (long)a * t2->H, (size_t)t2->H * sizeof(precision_t),
             cudaMemcpyDeviceToDevice, stream);
     }
+    // Publish metadata and device contents together. A different worker must
+    // not recycle the destination while this stream still copies its records.
+    cudaStreamSynchronize(stream);
+    pthread_mutex_unlock(&t2->reservoir_mutex);
 }
 
 void t2_apply_rewards(PuffeRL* p, RolloutBuf* train_view, int slot,
@@ -1168,8 +1241,9 @@ __global__ void t2_reencode_lanes_kernel(precision_t* __restrict__ state,
     }
 }
 
-// Reservoir states from a chunk: res_state[j, s] = state after step s.
-__global__ void t2_reencode_res_kernel(precision_t* __restrict__ res_state,
+// Recorded states from a chunk: record[j, s] = state after step s.
+// Used for active episode histories as well as completed replay histories.
+__global__ void t2_reencode_records_kernel(precision_t* __restrict__ res_state,
         precision_t* __restrict__ res_final, const precision_t* __restrict__ scan_h,
         const precision_t* __restrict__ next_state, const precision_t* __restrict__ out,
         const int* __restrict__ ids, const int* __restrict__ lens,
@@ -1226,6 +1300,58 @@ static void t2_reencode_chunk(T2* t2, const unsigned char* src_tok, const int* s
     }
 }
 
+// Continue each refreshed active prefix through its CPU suffix. Scratch stays
+// bounded by the existing M-step scan. No reset or padding is inserted between
+// chunks. out_last retains the GPU replay-prefix summary, matching res_len=M.
+static void t2_reencode_overflow(T2* t2, cudaStream_t stream) {
+    T2Train* tr = &t2->tr;
+    int H = t2->H;
+    for (int a = 0; a < t2->A; a++) {
+        T2Overflow* tail = &t2->overflow[a];
+        if (!tail->len) continue;
+        assert(t2->host_len[a] == t2->M && "T2 suffix requires its complete prefix");
+        cudaMemcpyAsync(tr->sample_slot.data, &a, sizeof(int), cudaMemcpyHostToDevice, stream);
+        for (size_t start = 0; start < tail->len; start += t2->M) {
+            int steps = (int)((tail->len - start) < (size_t)t2->M
+                ? tail->len - start : (size_t)t2->M);
+            cudaMemcpyAsync(tr->tok_seq.data, tail->tok + start * t2->L,
+                (size_t)steps * t2->L, cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(tr->act_seq.data, tail->act + start * t2->heads,
+                (size_t)steps * t2->heads * sizeof(int), cudaMemcpyHostToDevice, stream);
+            cudaMemsetAsync(tr->term.data, 0, steps * sizeof(precision_t), stream);
+            Prec input = {.data = tr->x_in.data, .shape = {steps, t2->E + t2->EA}};
+            Prec x = {.data = tr->x[0].data, .shape = {steps, H}};
+            t2_input_forward(t2, input, x, tr->tok_seq.data, tr->act_seq.data, steps, stream);
+            for (int l = 0; l < t2->Lg; l++) {
+                cudaMemcpyAsync(tr->init_state.data + (long)l * H,
+                    t2->state.data + ((long)l * t2->A + a) * H,
+                    H * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
+                Prec xl = {.data = tr->x[l].data, .shape = {steps, H}};
+                Prec combined = {.data = tr->combined[l].data, .shape = {steps, 3 * H}};
+                puf_mm(&xl, &t2->w.gru[l], &combined, stream);
+                PrefixScan scan = tr->scan[l];
+                scan.B = 1;
+                scan.T = steps;
+                scan.combined_ptr = combined.data;
+                scan.state_ptr = tr->init_state.data + (long)l * H;
+                scan.input_ptr = xl.data;
+                scan.terminals_ptr = tr->term.data;
+                mingru_scan_forward<<<grid_size(H), BLOCK_SIZE, 0, stream>>>(scan);
+                if (l + 1 < t2->Lg) {
+                    cudaMemcpyAsync(tr->x[l + 1].data, scan.out.data,
+                        (size_t)steps * H * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
+                }
+                t2_reencode_lanes_kernel<<<grid_size(H), BLOCK_SIZE, 0, stream>>>(
+                    t2->state.data, t2->state_prev.data, t2->out_last.data,
+                    scan.scan_h.data, scan.next_state.data, scan.out.data,
+                    tr->sample_slot.data, l, 0, 1, steps, t2->A, H);
+            }
+        }
+        // The next lane reuses the host ID and the scratch buffers.
+        cudaStreamSynchronize(stream);
+    }
+}
+
 void t2_reencode(T2* t2, cudaStream_t stream) {
     T2Train* tr = &t2->tr;
     int M = t2->M, H = t2->H, Lg = t2->Lg;
@@ -1236,10 +1362,11 @@ void t2_reencode(T2* t2, cudaStream_t stream) {
     int* ids_dev = tr->sample_slot.data;    // scratch: sample buffers are idle here
     int* lens_dev = tr->sample_t.data;
     assert(per_chunk >= 1 && t2->R >= per_chunk && "re-encode chunk exceeds sample scratch");
-    // Lanes with a complete record (an overflowed record cannot be replayed).
+    // Refresh every active GPU prefix, including exactly-full records. CPU
+    // suffixes continue these states below, before any new reward is scored.
     int count = 0;
     for (int a = 0; a < t2->A; a++) {
-        if (t2->host_len[a] > 0 && t2->host_len[a] < M) {
+        if (t2->host_len[a] > 0 && t2->host_len[a] <= M) {
             ids[count] = a;
             lens[count] = t2->host_len[a];
             count++;
@@ -1256,9 +1383,17 @@ void t2_reencode(T2* t2, cudaStream_t stream) {
                 t2->state.data, t2->state_prev.data, t2->out_last.data, sc->scan_h.data,
                 sc->next_state.data, tr->scan[Lg - 1].out.data, ids_dev, l, l == Lg - 1,
                 G, M, t2->A, H);
+            // Episode completion copies ep_state into replay. Refresh every
+            // recorded prefix now, not only the live carry at its end.
+            // out_last was already refreshed by the lane kernel above.
+            t2_reencode_records_kernel<<<grid_size((long)G * M * H), BLOCK_SIZE, 0, stream>>>(
+                t2->ep_state.data, t2->out_last.data, sc->scan_h.data,
+                sc->next_state.data, tr->scan[Lg - 1].out.data,
+                ids_dev, lens_dev, l, 0, G, M, Lg, H);
         }
         cudaStreamSynchronize(stream);
     }
+    t2_reencode_overflow(t2, stream);
     count = 0;
     for (int j = 0; j < t2->C; j++) {
         if (t2->res_len[j] > 0) {
@@ -1274,7 +1409,7 @@ void t2_reencode(T2* t2, cudaStream_t stream) {
         t2_reencode_chunk(t2, t2->res_tok.data, t2->res_act.data, ids_dev, lens_dev, G, stream);
         for (int l = 0; l < Lg; l++) {
             PrefixScan* sc = &tr->scan[l];
-            t2_reencode_res_kernel<<<grid_size((long)G * M * H), BLOCK_SIZE, 0, stream>>>(
+            t2_reencode_records_kernel<<<grid_size((long)G * M * H), BLOCK_SIZE, 0, stream>>>(
                 t2->res_state.data, t2->res_final.data, sc->scan_h.data, sc->next_state.data,
                 tr->scan[Lg - 1].out.data, ids_dev, lens_dev, l, l == Lg - 1, G, M, Lg, H);
         }
@@ -1556,6 +1691,7 @@ T2* t2_create(PuffeRL* p, Ini* ini) {
     assert(vec->size == vec->total_agents && "T2 requires one agent per env");
     int act_sizes[] = ACT_SIZES;
     T2* t2 = (T2*)calloc(1, sizeof(T2));
+    assert(pthread_mutex_init(&t2->reservoir_mutex,NULL)==0);
     t2->heads = NUM_ATNS;
     t2->act_rows = 0;
     for (int h = 0; h < NUM_ATNS; h++) {
@@ -1671,6 +1807,8 @@ T2* t2_create(PuffeRL* p, Ini* ini) {
         n / 1e6, a->total_bytes / 1e9, L, A, C, M);
 
     t2->host_len = (int*)calloc(A, sizeof(int));
+    t2->overflow = (T2Overflow*)calloc(A, sizeof(T2Overflow));
+    assert(t2->overflow && "T2 active history index allocation failed");
     t2->host_episode = (int*)calloc(A, sizeof(int));
     t2->res_len = (int*)calloc(C, sizeof(int));
     t2->res_pair = (int*)calloc(C, sizeof(int));

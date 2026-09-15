@@ -229,17 +229,23 @@ static double host_gelu(double x) {
     return 0.5 * x * (1.0 + erf(x / sqrt(2.0)));
 }
 
-static PuffeRL* make_trainer(Ini* ini, const char* method) {
+static PuffeRL* make_trainer(Ini* ini, const char* method,
+        int buffers = 1, int layers = 1, int async = 0) {
     puf_ini_put(ini, "intrinsic.method", method);
     puf_ini_put(ini, "vec.total_agents", "32");
-    puf_ini_put(ini, "vec.num_buffers", "1");
+    char value[32];
+    snprintf(value, sizeof(value), "%d", buffers);
+    puf_ini_put(ini, "vec.num_buffers", value);
     puf_ini_put(ini, "vec.num_threads", "4");
     puf_ini_put(ini, "train.horizon", "16");
     puf_ini_put(ini, "train.minibatch_size", "512");
-    puf_ini_put(ini, "base.async", "0");
+    snprintf(value, sizeof(value), "%d", async);
+    puf_ini_put(ini, "base.async", value);
     puf_ini_put(ini, "base.cudagraphs", "-1");
     puf_ini_put(ini, "t2.embed_dim", "32");
     puf_ini_put(ini, "t2.hidden_size", "32");
+    snprintf(value, sizeof(value), "%d", layers);
+    puf_ini_put(ini, "t2.num_layers", value);
     puf_ini_put(ini, "t2.head_dim", "32");
     puf_ini_put(ini, "t2.max_episode", "64");
     puf_ini_put(ini, "t2.reservoir", "16");
@@ -254,6 +260,10 @@ static PuffeRL* make_trainer(Ini* ini, const char* method) {
     TrainContext ctx = {.world_size = 1, .artifact_owner = 0};
     return create_pufferl(ini, &ctx);
 }
+
+#include "test_t2_history.cuh"
+#include "test_t2_record.cuh"
+#include "test_t2_limits.cuh"
 
 // ---------------------------------------------------------------------------
 // T2
@@ -377,8 +387,11 @@ static void test_literal_control_prefix(PuffeRL* p) {
     float* combined = prec_host(r->combined);
     float* x = prec_host(r->x);
     float* out = prec_host(r->out);
-    double maxerr = 0.0;
+    float* terminals = to_host(p->env.terminals.data, B, sizeof(float));
+    double maxerr = 0.0, reset_error = 0.0;
+    int compared = 0, resets = 0;
     for (int b = 0; b < B; b++) {
+        if (terminals[b] != 0.0f) resets++; else compared++;
         for (int h = 0; h < H; h++) {
             int row = B + b, cb = row * 3 * H;
             double hidden = combined[cb + h], gate = combined[cb + H + h];
@@ -389,12 +402,21 @@ static void test_literal_control_prefix(PuffeRL* p) {
             double s = 1.0 / (1.0 + exp(-proj));
             double expected = s * state + (1.0 - s) * x[row * H + h];
             double err = fabs(expected - out[row * H + h]);
-            maxerr = err > maxerr ? err : maxerr;
+            // Scoring preceded terminal reset; state_prev has since been
+            // cleared. Those rows have no bonus and no surviving prefix to
+            // compare. Their zero/reset behavior is checked by reward tests.
+            if (terminals[b] != 0.0f) {
+                CHECK(before[b * H + h] == 0.0f, "terminal clears state_prev");
+                reset_error = fmax(reset_error, err);
+            } else {
+                maxerr = fmax(maxerr, err);
+            }
         }
     }
+    CHECK(compared > 0, "literal control test covers nonterminal rows");
     CHECK(maxerr < (USE_BF16 ? 1e-2 : 1e-5), "literal control prefix max error %.3e", maxerr);
-    printf("PASS literal control prefix: max abs error %.2e\n", maxerr);
-    free(before); free(combined); free(x); free(out);
+    printf("PASS literal control prefix: max abs error %.2e; %d reset rows have obsolete-output error %.2e\n", maxerr, resets, reset_error);
+    free(before); free(combined); free(x); free(out); free(terminals);
 }
 
 // Online rewards: zero on the boundary row and on rows whose observation
@@ -646,6 +668,7 @@ static void run_t2_tests(Ini* ini) {
     t2_forward_backward(p->t2, p->train_stream);
     test_gather(p);
     test_t2_gradients(p);
+    test_updated_history_records(p);
     t2_train(p);
     CHECK(cudaGetLastError() == cudaSuccess, "train kernels");
     t2_save(p, "build/test_t2_weights.bin");
@@ -655,6 +678,7 @@ static void run_t2_tests(Ini* ini) {
     float* after = to_host(p->t2->master.data, numel(p->t2->master.shape), sizeof(float));
     CHECK(memcmp(before, after, numel(p->t2->master.shape) * sizeof(float)) == 0, "checkpoint");
     printf("PASS t2 checkpoint roundtrip\n");
+    test_record_publication(p);
     free(before); free(after);
     close_pufferl(p);
 }
@@ -984,6 +1008,7 @@ int main(int argc, char** argv) {
     test_nethack_pairing_and_codec(&ini);
 #endif
     run_t2_tests(&ini);
+    test_t2_history_limits(&ini);
     const char* methods[] = {"e3b", "icm", "rnd", "e3b_rnd"};
     for (int i = 0; i < 4; i++) {
         run_baseline_tests(&ini, methods[i]);
