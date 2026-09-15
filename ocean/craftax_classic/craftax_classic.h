@@ -34,6 +34,10 @@
 #include "raylib.h"
 
 typedef float obs_t;
+// T2 tokens: 63 block ids, 32 bytes of packed 4-bit mob flags (2 tiles per
+// byte), 12 inventory counts, 4 intrinsics, direction, light byte, sleeping.
+#define PUF_T2_TOKENS 114
+#define PUF_T2_PAIRED 1
 #include "pufferenv.h"
 
 #define ACT_SIZES {17}
@@ -171,6 +175,8 @@ struct Env {
 
     unsigned int rng;                   // populated by default my_vec_init (env index)
     uint64_t pcg;                       // actual RNG state (seeded from rng in my_init)
+    unsigned int t2_episode;            // resets so far on this lane (T2 pairing)
+    uint64_t t2_salt;                   // [env] t2_seed
 
     // One block per byte (BLK_RIPE_PLANT = 16 does not fit in a nibble).
     uint8_t map_packed[MAP_PACKED_SIZE];
@@ -914,6 +920,44 @@ static void compute_observations(CraftaxClassic* s) {
     obs[idx++] = s->is_sleeping ? 1.0f : 0.0f;
 }
 
+// T2 token codec: every observation field except the continuous light level
+// is reproduced exactly from these 114 bytes (light keeps 8 bits).
+void puf_t2_tokens(Env* s, unsigned char* out) {
+    int pr = s->player_r, pc = s->player_c;
+    unsigned char mob[63];
+    int k = 0;
+    for (int dr = -3; dr <= 3; dr++) {
+        int r = pr + dr;
+        bool row_ok = (unsigned)r < MAP_SIZE;
+        for (int dc = -4; dc <= 4; dc++) {
+            int c = pc + dc;
+            bool ok = row_ok && (unsigned)c < MAP_SIZE;
+            out[k] = ok ? (unsigned char)map_get(s, r, c) : BLK_OUT_OF_BOUNDS;
+            unsigned char m = 0;
+            if (ok) {
+                uint64_t bit = 1ULL << c;
+                m = ((s->zombie_bits[r] & bit) ? 1 : 0)
+                    | ((s->cow_bits[r] & bit) ? 2 : 0)
+                    | ((s->skel_bits[r] & bit) ? 4 : 0)
+                    | ((s->arrow_bits[r] & bit) ? 8 : 0);
+            }
+            mob[k++] = m;
+        }
+    }
+    for (int i = 0; i < 32; i++) {
+        out[63 + i] = mob[2 * i] | (2 * i + 1 < 63 ? mob[2 * i + 1] << 4 : 0);
+    }
+    k = 95;
+    for (int i = 0; i < NUM_INVENTORY; i++) out[k++] = (unsigned char)s->inv[i];
+    out[k++] = (unsigned char)s->health;
+    out[k++] = (unsigned char)s->food;
+    out[k++] = (unsigned char)s->drink;
+    out[k++] = (unsigned char)s->energy;
+    out[k++] = (unsigned char)s->player_dir;
+    out[k++] = (unsigned char)(s->light_level * 255.0f + 0.5f);
+    out[k++] = s->is_sleeping ? 1 : 0;
+}
+
 // ============================================================
 // Logging (stats accumulated into env->log; flushed at vec-level by PufferLib)
 // ============================================================
@@ -935,22 +979,36 @@ static void add_log(CraftaxClassic* env) {
 // ============================================================
 // Public API: c_init / puf_reset / puf_step / puf_close / puf_render
 // ============================================================
+static uint64_t cr_seed_state(uint64_t seed) {
+    uint64_t pcg = seed * 0x9E3779B97F4A7C15ULL + 0x87C37B91114253D5ULL;
+    // Warm the RNG a bit so small seeds don't produce correlated worlds.
+    for (int i = 0; i < 8; i++) (void)cr_pcg(&pcg);
+    return pcg;
+}
+
 static void c_init(CraftaxClassic* env) {
     env->num_agents = 1;
     env->client = NULL;
     // env->rng was seeded by default my_vec_init to the env index; use it to
     // initialize a proper 64-bit PCG state.
-    uint64_t seed = (uint64_t)env->rng;
-    env->pcg = seed * 0x9E3779B97F4A7C15ULL + 0x87C37B91114253D5ULL;
-    // Warm the RNG a bit so small seeds don't produce correlated worlds.
-    for (int i = 0; i < 8; i++) (void)cr_pcg(&env->pcg);
+    env->pcg = cr_seed_state((uint64_t)env->rng);
+    env->t2_episode = 0;
     memset(&env->log, 0, sizeof(env->log));
 }
 
 void puf_reset(CraftaxClassic* env) {
     env->episode_return_accum = 0.0f;
     env->episode_length_accum = 0;
+#ifdef PUFFER_T2
+    // Paired episodes (pufferenv.h): lanes 2k and 2k+1 generate the same
+    // world for the same episode index, then run on independent RNG streams.
+    env->pcg = cr_seed_state(puf_t2_world_seed(env->rng, env->t2_episode, env->t2_salt));
     generate_world(env);
+    env->pcg = cr_seed_state(puf_t2_dyn_seed(env->rng, env->t2_episode, env->t2_salt));
+#else
+    generate_world(env);
+#endif
+    env->t2_episode++;
     compute_observations(env);
 }
 
@@ -1217,6 +1275,8 @@ void puf_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
     env->agents[0].action_mask = NULL;
     env->agents[0].policy = 0;
+    DictItem* salt = dict_find(kwargs, "t2_seed");
+    env->t2_salt = salt ? (uint64_t)salt->value : 0;
     c_init(env);
 }
 

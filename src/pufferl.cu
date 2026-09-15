@@ -519,6 +519,7 @@ typedef struct {
     int skip_rollout_time;
 } Profile;
 
+struct T2;
 typedef struct PuffeRL {
     Policy* policies;        // [num_policies]; policies[0] trainable, rest frozen
     int num_policies;
@@ -564,7 +565,12 @@ typedef struct PuffeRL {
     ulong seed;
     curandStatePhilox4_32_10_t** rng_states;  // per-buffer persistent RNG states [num_buffers]
     char env_name[64];  // For policy arch rebuild at create.
+    struct T2* t2;      // --t2 world-model intrinsic reward; NULL when disabled
 } PuffeRL;
+
+#ifdef PUFFER_T2
+#include "t2.cu"
+#endif
 
 // Infer path: sample + forward, then vec workers.
 static void profile_begin(const char* tag, bool enable) {
@@ -1191,6 +1197,11 @@ static void* vec_thread_main(void* arg) {
             cpu_upload(pufferl, agent_start, apb, stream);
             cudaEventRecord(ev[H2D_END], stream);
             h2d_pending = 1;
+#ifdef PUFFER_T2
+            if (pufferl->t2) {
+                t2_worker_step(pufferl, buf, t, stream);
+            }
+#endif
         }
         cudaStreamSynchronize(stream);
         if (h2d_pending) {
@@ -1484,6 +1495,11 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     transpose_102<<<grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
         rollouts->action_mask.data, src.action_mask.data, T, B, mask_c);
 
+#ifdef PUFFER_T2
+    if (pufferl->t2) {
+        t2_apply_rewards(pufferl, rollouts, slot, stream);
+    }
+#endif
     clamp_precision_kernel<<<grid_size(
         numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
         rollouts->rewards.data, -1.0f, 1.0f, numel(rollouts->rewards.shape));
@@ -1892,6 +1908,11 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemset(env->terminals.data, 0, total_agents * sizeof(float));
     cudaMemset(env->action_mask.data, 1, mask_bytes);
 
+#ifdef PUFFER_T2
+    if (t2_enabled(ini)) {
+        dict_set(env_kwargs, "t2_seed", (double)hypers.seed);
+    }
+#endif
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
 
@@ -2075,6 +2096,9 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     }
 
     env_start(pufferl);
+#ifdef PUFFER_T2
+    pufferl->t2 = t2_enabled(ini) ? t2_create(pufferl, ini) : NULL;
+#endif
 
     if (hypers.profile) {
         cudaDeviceSynchronize();
@@ -3103,6 +3127,12 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             rollouts(pufferl);
             train_impl(pufferl, NULL);
         }
+#ifdef PUFFER_T2
+        // Workers are idle here, so the reservoir and WM weights are quiescent.
+        if (pufferl->t2) {
+            t2_train(pufferl);
+        }
+#endif
 
         char saved_checkpoint[4096] = {0};
         if (epoch == train_epochs - 1 || (checkpoint_interval > 0
@@ -3112,6 +3142,13 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             if (ctx->artifact_owner || use_selfplay) {
                 puf_save_weights(pufferl, saved_checkpoint);
             }
+#ifdef PUFFER_T2
+            if (pufferl->t2 && ctx->artifact_owner) {
+                char t2_checkpoint[4200];
+                snprintf(t2_checkpoint, sizeof(t2_checkpoint), "%s.t2", saved_checkpoint);
+                t2_save(pufferl, t2_checkpoint);
+            }
+#endif
             if (ctx->artifact_owner) {
                 snprintf(final_checkpoint, sizeof(final_checkpoint),
                     "%s", saved_checkpoint);
@@ -3165,6 +3202,11 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
 
         log_util(pufferl, &new_log);
+#ifdef PUFFER_T2
+        if (pufferl->t2) {
+            t2_log(pufferl, &new_log);
+        }
+#endif
 
         float train_total = 0;
         for (int i = 0; i < NUM_PROF; i++) {

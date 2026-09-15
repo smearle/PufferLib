@@ -36,11 +36,15 @@ fi
 
 USE_GPU_ENV=0
 SNAKE_RAW=0
+USE_T2=0
+T2_TEST=0
 while [ $# -gt 0 ]; do
     case $1 in
         --cu) USE_GPU_ENV=1 ;;
         --float) PRECISION="-DPRECISION_FLOAT" ;;
         --no-onehot) SNAKE_RAW=1 ;;
+        --t2) USE_T2=1 ;;
+        --t2-test) USE_T2=1; T2_TEST=1 ;;
         --debug) DEBUG=1 ;;
         --web)   MODE=web ;;
         --profile) MODE=profile ;;
@@ -83,7 +87,8 @@ PLATFORM="$(uname -s)"
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
     OMP_FLAGS=(-fopenmp)
-    OMP_LIB=-lomp5
+    # gcc host compilers link libgomp; LLVM's libomp5 is the upstream default.
+    OMP_LIB=${PUFFER_OMP_LIB:--lomp5}
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
 else
@@ -206,6 +211,9 @@ fi
 
 # src/ocean.cu compiles only this env's custom net (PUFFER_NETHACK, PUFFER_NMMO3, …).
 EXTRA_CFLAGS+=(-DPUFFER_${ENV^^})
+if [ "$USE_T2" = "1" ]; then
+    EXTRA_CFLAGS+=(-DPUFFER_T2)
+fi
 
 case "$ENV" in
     osrs_*)
@@ -502,6 +510,12 @@ if [ "$MODE" = "native" ]; then
                 -o "$OSRS_RENDER_OBJECT"
             ;;
     esac
+    MAIN_SRC=src/pufferl.cu
+    MAIN_DEFINE=-DPUFFERLIB_BUILD_MAIN
+    if [ "$T2_TEST" = "1" ]; then
+        MAIN_SRC=tests/test_t2.cu
+        MAIN_DEFINE=-DPUFFER_T2_TEST
+    fi
     echo "Compiling $ENV_HEADER -> $TRAIN_BIN..."
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
         -I. -Isrc -I$SRC_DIR -Ivendor \
@@ -510,13 +524,13 @@ if [ "$MODE" = "native" ]; then
 	    "${ENV_COMPILE_FLAGS[@]}" \
 	    -DENV_NAME=$ENV \
 	    -DPUFFER_ENV_NAME=\"$ENV\" \
-	    -DPUFFERLIB_BUILD_MAIN \
+	    $MAIN_DEFINE \
 	    -Xcompiler=-DPLATFORM_DESKTOP \
 	    -Xcompiler=-fopenmp \
 	    "${NVCC_NARROW[@]}" \
 	    "${EXTRA_CFLAGS[@]}" \
 	    $PRECISION \
-	    src/pufferl.cu \
+	    $MAIN_SRC \
         $EXTRA_SRC \
         $OSRS_RENDER_OBJECT \
         "${LINK_ARCHIVES[@]}" \

@@ -56,6 +56,46 @@ static inline void puf_set_bot_policy(Env* env, int bot_policy) {
 }
 #endif
 
+// T2 (peer-channel Double Take) env contract. Optional: only a trainer built
+// with --t2 (PUFFER_T2) uses it, and every env keeps working without it.
+//
+// Paired episodes. The trainer creates envs with env->rng = lane index, so
+// lanes 2k and 2k+1 form pair k. An env that supports pairing draws its
+// reset-persistent content (terrain, item placement, initial mobs) from
+// puf_t2_world_seed(lane, episode, salt) and its transition randomness from
+// puf_t2_dyn_seed(lane, episode, salt), where episode counts that lane's
+// resets from 0 and salt is the [env] t2_seed. Partner lanes then replay the
+// same world with independent dynamics, which is what the T2 peer support
+// channel is trained on. Define PUF_T2_PAIRED once puf_reset does this; envs
+// without it train T2 from self-prefix support only.
+//
+// Tokens. T2 scores each successor observation as a string of PUF_T2_TOKENS
+// bytes. Define PUF_T2_TOKENS and puf_t2_tokens() for a lossless compact
+// encoding of the observation; otherwise the trainer quantizes every
+// observation value into one byte (exact for binary and small-integer
+// observations, lossy for continuous ones).
+static inline uint64_t puf_t2_mix(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+static inline uint64_t puf_t2_world_seed(unsigned lane, unsigned episode,
+        uint64_t salt) {
+    return puf_t2_mix(puf_t2_mix(salt) ^ (((uint64_t)(lane >> 1) << 32) | episode));
+}
+
+static inline uint64_t puf_t2_dyn_seed(unsigned lane, unsigned episode,
+        uint64_t salt) {
+    return puf_t2_mix(puf_t2_mix(salt ^ 0xD1B54A32D192ED03ULL)
+        ^ (((uint64_t)lane << 32) | episode));
+}
+
+#ifdef PUF_T2_TOKENS
+void puf_t2_tokens(Env* env, unsigned char* out);
+#endif
+
 typedef uint16_t bf16;
 
 static inline bf16 f32_to_bf16(float f) {
