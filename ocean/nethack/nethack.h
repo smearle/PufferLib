@@ -17,6 +17,13 @@
 #include <signal.h>
 #include "fs.h"
 typedef unsigned char obs_t;
+// T2 tokens: 9x9 egocentric glyph crop (2 bytes per cell), 16 status bytes,
+// the first 24 message bytes, per-class inventory counts and 3 state bytes.
+#define NETHACK_T2_CROP 9
+#define NETHACK_T2_MSG 24
+#define PUF_T2_TOKENS (2 * NETHACK_T2_CROP * NETHACK_T2_CROP + 16 + NETHACK_T2_MSG \
+    + NETHACK_NUM_OCLASSES + 3)
+#define PUF_T2_PAIRED 1
 #include "pufferenv.h"
 
 // nletypes.h, not nle.h: nle.h's `settings` macro would rewrite env->settings
@@ -43,6 +50,7 @@ extern int nle_cast_blocked(nle_ctx_t*);
 extern int nle_intrinsics(nle_ctx_t*);
 extern void nle_end(nle_ctx_t*);
 extern void nle_identity(nle_ctx_t*, int*, int*, int*, int*);
+extern void nle_set_seed(nle_ctx_t*, unsigned long, unsigned long, char, unsigned long);
 #ifdef __cplusplus
 }
 #endif
@@ -71,6 +79,8 @@ struct Env {
     int boundary_reached;
     unsigned int rng; // required by vecenv.h
     unsigned long seed; // advanced each reset
+    unsigned int t2_episode; // resets so far on this lane (T2 pairing)
+    unsigned long t2_salt; // [env] t2_seed
     int role_idx, race_idx, gend_idx; // multi-role identity (read back)
 
     // engine handle
@@ -735,6 +745,44 @@ static void nethack_pack_obs(Nethack* env) {
     if (env->action_mask != NULL) nethack_compute_mask(env);
 }
 
+// T2 token codec: egocentric glyph crop, status bytes, message prefix and
+// inventory class counts, a compact target for the successor likelihood.
+void puf_t2_tokens(Env* env, unsigned char* out) {
+    int k = 0, half = NETHACK_T2_CROP / 2;
+    long hx = env->blstats[NLE_BL_X], hy = env->blstats[NLE_BL_Y];
+    for (int dy = -half; dy <= half; dy++) {
+        for (int dx = -half; dx <= half; dx++) {
+            long x = hx + dx, y = hy + dy;
+            unsigned short g = NETHACK_PAD_GLYPH;
+            if (env->glyphs && x >= 0 && x < NH_COLS && y >= 0 && y < NH_ROWS)
+                g = (unsigned short)env->glyphs[y * NH_COLS + x];
+            out[k++] = (unsigned char)(g & 0xff);
+            out[k++] = (unsigned char)(g >> 8);
+        }
+    }
+    const long* b = env->blstats;
+    long vals[16] = {b[NLE_BL_X], b[NLE_BL_Y], b[NLE_BL_DEPTH], b[NLE_BL_DNUM],
+        b[NLE_BL_DLEVEL], b[NLE_BL_HP], b[NLE_BL_HPMAX], b[NLE_BL_ENE], b[NLE_BL_ENEMAX],
+        b[NLE_BL_AC] + 128, b[NLE_BL_XP], b[NLE_BL_EXP] >> 4, b[NLE_BL_GOLD] >> 3,
+        b[NLE_BL_HUNGER], b[NLE_BL_CAP], b[NLE_BL_CONDITION] & 255};
+    for (int i = 0; i < 16; i++) {
+        long v = vals[i] < 0 ? 0 : (vals[i] > 255 ? 255 : vals[i]);
+        out[k++] = (unsigned char)v;
+    }
+    for (int i = 0; i < NETHACK_T2_MSG; i++) out[k++] = env->message[i];
+    unsigned char cnt[NETHACK_NUM_OCLASSES];
+    memset(cnt, 0, sizeof(cnt));
+    for (int i = 0; i < NLE_INVENTORY_SIZE; i++) {
+        int oc = env->inv_oclasses[i];
+        if (oc >= NETHACK_NUM_OCLASSES) break; // padded tail
+        if (cnt[oc] < 255) cnt[oc]++;
+    }
+    for (int i = 0; i < NETHACK_NUM_OCLASSES; i++) out[k++] = cnt[i];
+    out[k++] = (unsigned char)(env->prev_action + 1);
+    out[k++] = (unsigned char)(env->internal[6] & 3);
+    out[k++] = (unsigned char)env->n_spells;
+}
+
 // logging
 
 static void nethack_add_log(Nethack* env, int how) { // how: nle how_done, -1 = truncated
@@ -809,12 +857,30 @@ static void nethack_do_reset(Nethack* env) {
                      "name:Agent,role:random,race:random,gender:random,"
                      "align:random," NETHACK_OPTIONS_TAIL "!status_updates"));
     }
+#ifdef PUFFER_T2
+    // Paired episodes (pufferenv.h): lanes 2k and 2k+1 boot from the same
+    // core seed (character, first level) and the same level-generation seed;
+    // after boot the core/display streams switch to a lane-specific seed so
+    // partners share the dungeon and diverge in everything else.
+    unsigned long world = puf_t2_world_seed(env->rng, env->t2_episode, env->t2_salt);
+    unsigned long dyn = puf_t2_dyn_seed(env->rng, env->t2_episode, env->t2_salt);
+    env->t2_episode++;
+    env->settings.initial_seeds.seeds[0] = world;
+    env->settings.initial_seeds.seeds[1] = world ^ 0x9E3779B97F4A7C15UL;
+    env->settings.initial_seeds.lgen_seed = world;
+    env->settings.initial_seeds.use_lgen_seed = true;
+    env->settings.time_seed = world;
+#else
     env->settings.initial_seeds.seeds[0] = env->seed;
     env->settings.initial_seeds.seeds[1] = env->seed ^ 0x9E3779B97F4A7C15UL;
-    env->settings.initial_seeds.use_init_seeds = true;
     env->settings.time_seed = env->seed;
+#endif
+    env->settings.initial_seeds.use_init_seeds = true;
     env->settings.time_seed_is_set = true;
     env->ctx = nle_start(&env->obs, NULL, &env->settings);
+#ifdef PUFFER_T2
+    nle_set_seed(env->ctx, dyn, dyn ^ 0x9E3779B97F4A7C15UL, 0, world);
+#endif
 
     nethack_drain_prompts(env);
     {
@@ -1225,6 +1291,9 @@ void puf_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
     env->agents[0].policy = 0;
     init(env);
+    DictItem* salt = dict_find(kwargs, "t2_seed");
+    env->t2_salt = salt ? (unsigned long)salt->value : 0;
+    env->t2_episode = 0;
     env->gold_coef = dict_get(kwargs, "gold_coef");
     env->score_coef = dict_get(kwargs, "score_coef");
     env->exp_coef = dict_get(kwargs, "exp_coef");

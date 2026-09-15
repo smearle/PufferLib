@@ -513,7 +513,7 @@ if [ "$MODE" = "native" ]; then
     MAIN_SRC=src/pufferl.cu
     MAIN_DEFINE=-DPUFFERLIB_BUILD_MAIN
     if [ "$T2_TEST" = "1" ]; then
-        MAIN_SRC=tests/test_t2.cu
+        MAIN_SRC=tests/test_intrinsic.cu
         MAIN_DEFINE=-DPUFFER_T2_TEST
     fi
     echo "Compiling $ENV_HEADER -> $TRAIN_BIN..."

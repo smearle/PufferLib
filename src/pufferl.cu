@@ -520,6 +520,7 @@ typedef struct {
 } Profile;
 
 struct T2;
+struct Intrinsic;
 typedef struct PuffeRL {
     Policy* policies;        // [num_policies]; policies[0] trainable, rest frozen
     int num_policies;
@@ -565,11 +566,12 @@ typedef struct PuffeRL {
     ulong seed;
     curandStatePhilox4_32_10_t** rng_states;  // per-buffer persistent RNG states [num_buffers]
     char env_name[64];  // For policy arch rebuild at create.
-    struct T2* t2;      // --t2 world-model intrinsic reward; NULL when disabled
+    struct T2* t2;          // T2 world-model reward; NULL unless [intrinsic] method = t2
+    struct Intrinsic* ir;   // --t2 build: intrinsic reward dispatcher; NULL when none
 } PuffeRL;
 
 #ifdef PUFFER_T2
-#include "t2.cu"
+#include "intrinsic.cu"
 #endif
 
 // Infer path: sample + forward, then vec workers.
@@ -1198,8 +1200,8 @@ static void* vec_thread_main(void* arg) {
             cudaEventRecord(ev[H2D_END], stream);
             h2d_pending = 1;
 #ifdef PUFFER_T2
-            if (pufferl->t2) {
-                t2_worker_step(pufferl, buf, t, stream);
+            if (pufferl->ir) {
+                ir_worker_step(pufferl, buf, t, stream);
             }
 #endif
         }
@@ -1496,8 +1498,8 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         rollouts->action_mask.data, src.action_mask.data, T, B, mask_c);
 
 #ifdef PUFFER_T2
-    if (pufferl->t2) {
-        t2_apply_rewards(pufferl, rollouts, slot, stream);
+    if (pufferl->ir) {
+        ir_apply_rewards(pufferl, rollouts, slot, stream);
     }
 #endif
     clamp_precision_kernel<<<grid_size(
@@ -1909,9 +1911,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemset(env->action_mask.data, 1, mask_bytes);
 
 #ifdef PUFFER_T2
-    if (t2_enabled(ini)) {
-        dict_set(env_kwargs, "t2_seed", (double)hypers.seed);
-    }
+    ir_env_kwargs(ini, env_kwargs, hypers.seed);
 #endif
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
@@ -2097,7 +2097,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 
     env_start(pufferl);
 #ifdef PUFFER_T2
-    pufferl->t2 = t2_enabled(ini) ? t2_create(pufferl, ini) : NULL;
+    pufferl->ir = ir_create(pufferl, ini);
 #endif
 
     if (hypers.profile) {
@@ -3128,9 +3128,9 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             train_impl(pufferl, NULL);
         }
 #ifdef PUFFER_T2
-        // Workers are idle here, so the reservoir and WM weights are quiescent.
-        if (pufferl->t2) {
-            t2_train(pufferl);
+        // Workers are idle here, so intrinsic buffers and weights are quiescent.
+        if (pufferl->ir) {
+            ir_train(pufferl);
         }
 #endif
 
@@ -3143,10 +3143,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
                 puf_save_weights(pufferl, saved_checkpoint);
             }
 #ifdef PUFFER_T2
-            if (pufferl->t2 && ctx->artifact_owner) {
-                char t2_checkpoint[4200];
-                snprintf(t2_checkpoint, sizeof(t2_checkpoint), "%s.t2", saved_checkpoint);
-                t2_save(pufferl, t2_checkpoint);
+            if (pufferl->ir && ctx->artifact_owner) {
+                ir_save(pufferl, saved_checkpoint);
             }
 #endif
             if (ctx->artifact_owner) {
@@ -3203,8 +3201,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
 
         log_util(pufferl, &new_log);
 #ifdef PUFFER_T2
-        if (pufferl->t2) {
-            t2_log(pufferl, &new_log);
+        if (pufferl->ir) {
+            ir_log(pufferl, &new_log);
         }
 #endif
 

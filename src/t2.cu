@@ -47,7 +47,7 @@ enum {
 
 struct T2Weights {
     Prec tok_embed;   // (T2_TOKENS * T2_VOCAB, E): per-position token bag
-    Prec act_embed;   // (num_actions + 1, EA); PAD = num_actions
+    Prec act_embed;   // (sum_h (act_sizes[h] + 1), EA); each head has a PAD row
     Prec w_in;        // (H, E + EA)
     Prec gru[T2_MAX_LAYERS];  // (3H, H) minGRU per layer
     Prec role;        // (1, H): added to every support summary
@@ -60,8 +60,8 @@ struct T2Weights {
 struct T2Rollout {
     Byte tok_cur, tok_next;   // (B, L) tokens of o_t and o_{t+1}
     Byte target2;             // (2B, L) tok_{t+1} for both scoring rows
-    Int act;                  // (B,) a_t as ints
-    Int pad;                  // (B,) PAD action
+    Int act;                  // (B, heads) a_t as ints
+    Int pad;                  // (B, heads) PAD per head
     Prec x_in;                // (3B, E + EA)
     Prec x;                   // (3B, H) layer input
     Prec combined;            // (3B, 3H)
@@ -80,7 +80,7 @@ struct T2Rollout {
 struct T2Train {
     Int sample_slot, sample_t, sample_mode, sample_partner;  // (R,)
     Byte tok_seq;             // (2R, W, L)
-    Int act_seq;              // (2R, W)
+    Int act_seq;              // (2R * W, heads)
     Prec term;                // (2R, W) window resets
     Byte target;              // (R, L)
     Prec init_state;          // (Lg, 2R, H)
@@ -117,7 +117,13 @@ struct T2 {
     int A;                    // total agents (lanes)
     int L;                    // tokens per observation
     int E, EA, H, Lg, D;      // embed, action embed, hidden, layers, head width
-    int num_actions;          // PAD action id
+    int heads;                // action heads (NUM_ATNS)
+    int act_rows;             // sum_h (act_sizes[h] + 1) embedding rows
+    int act_sizes[PUF_MAX_DIMS * 4];
+    int head_off[PUF_MAX_DIMS * 4];
+    int* act_sizes_dev;       // device copies of the two tables
+    int* head_off_dev;
+    int reencode;             // re-encode lane/reservoir states after WM updates
     int M;                    // max recorded episode length
     int C;                    // reservoir episodes (pair slots = C / 2)
     int R;                    // training rows per step
@@ -141,7 +147,7 @@ struct T2 {
     Prec state, state_prev;   // (Lg, A, H) recurrent state after (o_t, a_t) and before
     Prec out_last;            // (A, H) last query output (peer summary source)
     Byte ep_tok;              // (A, M, L)
-    Int ep_act;               // (A, M)
+    Int ep_act;               // (A, M, heads)
     Prec ep_state;            // (A, M, Lg, H) state after each recorded step
     Int ep_len;               // (A,) device copy of the recorded length
     int* host_len;            // mirror
@@ -152,7 +158,7 @@ struct T2 {
 
     // Reservoir (device rows + host index). Slots 2j, 2j+1 hold pair j.
     Byte res_tok;             // (C, M, L)
-    Int res_act;              // (C, M)
+    Int res_act;              // (C, M, heads)
     Prec res_state;           // (C, M, Lg, H)
     Prec res_final;           // (C, H) partner summary
     int* res_len;             // host (C,) 0 = empty
@@ -182,12 +188,13 @@ __device__ __forceinline__ float t2_gelu_grad(float x) {
     return cdf + x * pdf;
 }
 
-// x_in[row] = [sum_p tok_embed[p, tok[row, p]] ; act_embed[act[row]]]
+// x_in[row] = [sum_p tok_embed[p, tok[row, p]] ; sum_h act_embed[off_h + act[row, h]]]
+// with act (rows, heads); a head's PAD row is off_h + act_sizes[h].
 __global__ void t2_embed_kernel(precision_t* __restrict__ x_in,
         const unsigned char* __restrict__ tok, const int* __restrict__ act,
         const precision_t* __restrict__ tok_embed,
-        const precision_t* __restrict__ act_embed,
-        int rows, int L, int E, int EA) {
+        const precision_t* __restrict__ act_embed, const int* __restrict__ head_off,
+        int rows, int L, int E, int EA, int heads) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int width = E + EA;
     if (idx >= rows * width) {
@@ -201,7 +208,10 @@ __global__ void t2_embed_kernel(precision_t* __restrict__ x_in,
             v += to_float(tok_embed[((long)p * T2_VOCAB + t[p]) * E + col]);
         }
     } else {
-        v = to_float(act_embed[(long)act[row] * EA + (col - E)]);
+        for (int h = 0; h < heads; h++) {
+            v += to_float(act_embed[(long)(head_off[h] + act[(long)row * heads + h]) * EA
+                + (col - E)]);
+        }
     }
     x_in[idx] = from_float(v);
 }
@@ -241,7 +251,7 @@ __global__ void t2_tok_embed_backward_kernel(long long* __restrict__ tok_grad_i,
 
 __global__ void t2_act_embed_backward_kernel(long long* __restrict__ act_grad_i,
         const precision_t* __restrict__ d_x_in, const int* __restrict__ act,
-        int rows, int E, int EA) {
+        const int* __restrict__ head_off, int rows, int E, int EA, int heads) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= rows * EA) {
         return;
@@ -249,9 +259,12 @@ __global__ void t2_act_embed_backward_kernel(long long* __restrict__ act_grad_i,
     int row = idx / EA, col = idx % EA;
     int width = E + EA;
     long long g = __float2ll_rn(to_float(d_x_in[(long)row * width + E + col]) * T2_FXP);
-    if (g != 0) {
-        atomicAdd((unsigned long long*)&act_grad_i[(long)act[row] * EA + col],
-            (unsigned long long)g);
+    if (g == 0) {
+        return;
+    }
+    for (int h = 0; h < heads; h++) {
+        long at = (long)(head_off[h] + act[(long)row * heads + h]) * EA + col;
+        atomicAdd((unsigned long long*)&act_grad_i[at], (unsigned long long)g);
     }
 }
 
@@ -264,11 +277,14 @@ __global__ void t2_fxp_to_precision_kernel(precision_t* __restrict__ dst,
 }
 
 // One minGRU layer step for three groups sharing lane indices:
-//   group 0 (query, action a_t) from state, writes the new lane state;
-//   group 1 (ctrl support, PAD) from state_prev;
-//   group 2 (q1 support, PAD) from the new query state.
-// Called once per layer; combined/x/out hold 3B rows, states hold this
-// layer's (B, H) slice. Terminal resets are applied afterwards.
+//   group 0 (query, action a_t) from the lane state S_{t-1}, writes S_t;
+//   group 1 (ctrl support, PAD) from S_{t-1}: the prefix through
+//           (o_{t-1}, a_{t-1}) then (o_t, PAD), the literal control prefix;
+//   group 2 (q1 support, PAD) from S_t: the prefix through (o_t, a_t) then
+//           (o_{t+1}, PAD).
+// state_prev keeps S_{t-1} for audits. Called once per layer; combined/x/out
+// hold 3B rows, states hold this layer's (B, H) slice. Terminal resets are
+// applied afterwards.
 __global__ void t2_gate3_kernel(precision_t* __restrict__ out,
         precision_t* __restrict__ state, precision_t* __restrict__ state_prev,
         const precision_t* __restrict__ combined, const precision_t* __restrict__ x,
@@ -278,9 +294,8 @@ __global__ void t2_gate3_kernel(precision_t* __restrict__ out,
         return;
     }
     int b = idx / H, h = idx % H;
-    float h_prev = to_float(state_prev[idx]);
     float h_cur = to_float(state[idx]);
-    float h_in[3] = {h_cur, h_prev, 0.0f};
+    float h_in[3] = {h_cur, h_cur, 0.0f};
     float h_new = 0.0f;
     for (int g = 0; g < 3; g++) {
         int row = g * B + b;
@@ -561,7 +576,7 @@ __global__ void t2_record_kernel(unsigned char* __restrict__ ep_tok,
         const unsigned char* __restrict__ tok, const int* __restrict__ act,
         const precision_t* __restrict__ state, const precision_t* __restrict__ out,
         const float* __restrict__ terminals, int agent0, int B, int A,
-        int L, int M, int Lg, int H) {
+        int L, int M, int Lg, int H, int heads) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int per_lane = L + Lg * H;
     if (idx >= B * per_lane) {
@@ -582,8 +597,8 @@ __global__ void t2_record_kernel(unsigned char* __restrict__ ep_tok,
                 out_last[(long)a * H + h] = out[(long)b * H + h];
             }
         }
-        if (k == 0) {
-            ep_act[(long)a * M + len] = act[b];
+        if (k < heads) {
+            ep_act[((long)a * M + len) * heads + k] = act[(long)b * heads + k];
         }
     }
     if (k == 0) {
@@ -591,12 +606,22 @@ __global__ void t2_record_kernel(unsigned char* __restrict__ ep_tok,
     }
 }
 
+// Rollout actions (B, heads) as ints; heads a verb does not consume read as
+// PAD so unused arguments do not condition the world model.
 __global__ void t2_actions_kernel(int* __restrict__ dst, const float* __restrict__ src,
-        int B, int stride) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b < B) {
-        dst[b] = (int)src[(long)b * stride];
+        const int* __restrict__ act_sizes, int B, int heads) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * heads) {
+        return;
     }
+    int b = idx / heads, h = idx % heads;
+    int a = (int)src[idx];
+#ifdef PUFFER_NETHACK
+    if (!nethack_head_used((int)src[(long)b * heads], h)) {
+        a = act_sizes[h];
+    }
+#endif
+    dst[idx] = a;
 }
 
 // Gather training windows. Rows [0, R): query windows ending at (slot, t);
@@ -608,8 +633,8 @@ __global__ void t2_gather_kernel(unsigned char* __restrict__ tok_seq,
         unsigned char* __restrict__ target, precision_t* __restrict__ init_state,
         const int* __restrict__ slot, const int* __restrict__ t_at,
         const unsigned char* __restrict__ res_tok, const int* __restrict__ res_act,
-        const precision_t* __restrict__ res_state, int R, int W, int L, int M,
-        int Lg, int H, int pad_action) {
+        const precision_t* __restrict__ res_state, const int* __restrict__ act_sizes,
+        int R, int W, int L, int M, int Lg, int H, int heads) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= 2 * R * W) {
         return;
@@ -623,15 +648,20 @@ __global__ void t2_gather_kernel(unsigned char* __restrict__ tok_seq,
         for (int p = 0; p < L; p++) {
             dst[p] = 0;
         }
-        act_seq[idx] = pad_action;
+        for (int h = 0; h < heads; h++) {
+            act_seq[(long)idx * heads + h] = act_sizes[h];
+        }
         term[idx] = from_float(0.0f);
     } else {
         const unsigned char* s = res_tok + ((long)j * M + src) * L;
         for (int p = 0; p < L; p++) {
             dst[p] = s[p];
         }
-        int last = w == W - 1;
-        act_seq[idx] = (row >= R && last) ? pad_action : res_act[(long)j * M + src];
+        int pad = row >= R && w == W - 1;
+        for (int h = 0; h < heads; h++) {
+            act_seq[(long)idx * heads + h] = pad ? act_sizes[h]
+                : res_act[((long)j * M + src) * heads + h];
+        }
         term[idx] = from_float(src == 0 ? 1.0f : 0.0f);
     }
     if (w == 0) {
@@ -740,7 +770,7 @@ static void t2_input_forward(T2* t2, Prec x_in, Prec x, const unsigned char* tok
         const int* act, int rows, cudaStream_t stream) {
     t2_embed_kernel<<<grid_size(rows * (t2->E + t2->EA)), BLOCK_SIZE, 0, stream>>>(
         x_in.data, tok, act, t2->w.tok_embed.data, t2->w.act_embed.data,
-        rows, t2->L, t2->E, t2->EA);
+        t2->head_off_dev, rows, t2->L, t2->E, t2->EA, t2->heads);
     puf_mm(&x_in, &t2->w.w_in, &x, stream);
 }
 
@@ -760,10 +790,10 @@ void t2_rollout_step(PuffeRL* p, int buf, int t, cudaStream_t stream) {
     // Tokens of o_{t+1} (just uploaded by the worker) and a_t as ints.
     cudaMemcpyAsync(r->tok_next.data, t2->host_tok + (long)agent0 * t2->L,
         (size_t)B * t2->L, cudaMemcpyHostToDevice, stream);
-    int act_stride = (int)rollouts.actions.shape[2];
-    const float* act_t = rollouts.actions.data + ((long)t * t2->A + agent0) * act_stride;
-    t2_actions_kernel<<<grid_size(B), BLOCK_SIZE, 0, stream>>>(
-        r->act.data, act_t, B, act_stride);
+    int heads = t2->heads;
+    const float* act_t = rollouts.actions.data + ((long)t * t2->A + agent0) * heads;
+    t2_actions_kernel<<<grid_size(B * heads), BLOCK_SIZE, 0, stream>>>(
+        r->act.data, act_t, t2->act_sizes_dev, B, heads);
     // Embedding rows: [query: (tok_t, a_t)] [ctrl: (tok_t, PAD)] [q1: (tok_{t+1}, PAD)].
     int width = t2->E + t2->EA;
     const unsigned char* toks[3] = {r->tok_cur.data, r->tok_cur.data, r->tok_next.data};
@@ -771,7 +801,7 @@ void t2_rollout_step(PuffeRL* p, int buf, int t, cudaStream_t stream) {
     for (int g = 0; g < 3; g++) {
         t2_embed_kernel<<<grid_size(B * width), BLOCK_SIZE, 0, stream>>>(
             r->x_in.data + (long)g * B * width, toks[g], acts[g], t2->w.tok_embed.data,
-            t2->w.act_embed.data, B, t2->L, t2->E, t2->EA);
+            t2->w.act_embed.data, t2->head_off_dev, B, t2->L, t2->E, t2->EA, heads);
     }
     puf_mm(&r->x_in, &t2->w.w_in, &r->x, stream);
     const float* term = p->env.terminals.data + agent0;
@@ -791,7 +821,7 @@ void t2_rollout_step(PuffeRL* p, int buf, int t, cudaStream_t stream) {
     t2_record_kernel<<<grid_size(B * (t2->L + Lg * H)), BLOCK_SIZE, 0, stream>>>(
         t2->ep_tok.data, t2->ep_act.data, t2->ep_state.data, t2->ep_len.data,
         t2->out_last.data, r->tok_cur.data, r->act.data, t2->state.data, r->out.data,
-        term, agent0, B, t2->A, t2->L, t2->M, Lg, H);
+        term, agent0, B, t2->A, t2->L, t2->M, Lg, H, heads);
     for (int l = 0; l < Lg; l++) {
         t2_reset_states_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
             t2->state.data + ((long)l * t2->A + agent0) * H,
@@ -869,9 +899,9 @@ void t2_episode_bookkeeping(PuffeRL* p, int buf, cudaStream_t stream) {
         cudaMemcpyAsync(t2->res_tok.data + (long)j * t2->M * t2->L,
             t2->ep_tok.data + (long)a * t2->M * t2->L, (size_t)len * t2->L,
             cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(t2->res_act.data + (long)j * t2->M,
-            t2->ep_act.data + (long)a * t2->M, (size_t)len * sizeof(int),
-            cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(t2->res_act.data + (long)j * t2->M * t2->heads,
+            t2->ep_act.data + (long)a * t2->M * t2->heads,
+            (size_t)len * t2->heads * sizeof(int), cudaMemcpyDeviceToDevice, stream);
         cudaMemcpyAsync(t2->res_state.data + (long)j * t2->M * t2->Lg * t2->H,
             t2->ep_state.data + (long)a * t2->M * t2->Lg * t2->H,
             (size_t)len * t2->Lg * t2->H * sizeof(precision_t),
@@ -947,8 +977,8 @@ static float t2_forward_backward(T2* t2, cudaStream_t stream) {
     t2_gather_kernel<<<grid_size(2 * R * W), BLOCK_SIZE, 0, stream>>>(
         tr->tok_seq.data, tr->act_seq.data, tr->term.data, tr->target.data,
         tr->init_state.data, tr->sample_slot.data, tr->sample_t.data,
-        t2->res_tok.data, t2->res_act.data, t2->res_state.data, R, W, L, t2->M,
-        Lg, H, t2->num_actions);
+        t2->res_tok.data, t2->res_act.data, t2->res_state.data, t2->act_sizes_dev,
+        R, W, L, t2->M, Lg, H, t2->heads);
 
     // Forward: embed -> w_in -> minGRU scans (2R sequences of W) -> head.
     t2_input_forward(t2, tr->x_in, tr->x[0], tr->tok_seq.data, tr->act_seq.data,
@@ -1022,7 +1052,7 @@ static float t2_forward_backward(T2* t2, cudaStream_t stream) {
         rows, L, t2->E, t2->EA);
     t2_act_embed_backward_kernel<<<grid_size(rows * t2->EA), BLOCK_SIZE, 0, stream>>>(
         (long long*)tr->act_embed_grad_i.data, tr->d_x_in.data, tr->act_seq.data,
-        rows, t2->E, t2->EA);
+        t2->head_off_dev, rows, t2->E, t2->EA, t2->heads);
     t2_fxp_to_precision_kernel<<<grid_size(n_tok), BLOCK_SIZE, 0, stream>>>(
         t2->g.tok_embed.data, (long long*)tr->tok_embed_grad_i.data, n_tok);
     t2_fxp_to_precision_kernel<<<grid_size(n_act), BLOCK_SIZE, 0, stream>>>(
@@ -1077,12 +1107,192 @@ static void t2_train_step(T2* t2, cudaStream_t stream) {
     cudaMemcpy(t2->stats, cur, sizeof(cur), cudaMemcpyHostToDevice);
 }
 
+// ---------------------------------------------------------------------------
+// Re-encoding under the current weights: after WM updates, streaming lane
+// states and reservoir states are stale continuations of older weights.
+// Records are replayed right-aligned in windows of M steps (reset flag at
+// the first real step), in chunks that reuse the training scan buffers, so
+// every stored state is again a literal encoding of its prefix.
+// ---------------------------------------------------------------------------
+
+__global__ void t2_reencode_gather_kernel(unsigned char* __restrict__ tok_seq,
+        int* __restrict__ act_seq, precision_t* __restrict__ term,
+        const unsigned char* __restrict__ src_tok, const int* __restrict__ src_act,
+        const int* __restrict__ ids, const int* __restrict__ lens,
+        const int* __restrict__ act_sizes, int G, int M, int L, int heads) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= G * M) {
+        return;
+    }
+    int g = idx / M, w = idx % M;
+    int len = lens[g], pos = w - (M - len);
+    unsigned char* dst = tok_seq + (long)idx * L;
+    if (pos < 0) {
+        for (int p = 0; p < L; p++) {
+            dst[p] = 0;
+        }
+        for (int h = 0; h < heads; h++) {
+            act_seq[(long)idx * heads + h] = act_sizes[h];
+        }
+        term[idx] = from_float(0.0f);
+        return;
+    }
+    long rec = (long)ids[g] * M + pos;
+    const unsigned char* s = src_tok + rec * L;
+    for (int p = 0; p < L; p++) {
+        dst[p] = s[p];
+    }
+    for (int h = 0; h < heads; h++) {
+        act_seq[(long)idx * heads + h] = src_act[rec * heads + h];
+    }
+    term[idx] = from_float(pos == 0 ? 1.0f : 0.0f);
+}
+
+// Lane states from a chunk: state = last post-step state, state_prev = the
+// state before the last step, out_last = last output (last layer only).
+__global__ void t2_reencode_lanes_kernel(precision_t* __restrict__ state,
+        precision_t* __restrict__ state_prev, precision_t* __restrict__ out_last,
+        const precision_t* __restrict__ scan_h, const precision_t* __restrict__ next_state,
+        const precision_t* __restrict__ out, const int* __restrict__ ids,
+        int layer, int last_layer, int G, int M, int A, int H) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= G * H) {
+        return;
+    }
+    int g = idx / H, h = idx % H;
+    long a = ids[g];
+    state[((long)layer * A + a) * H + h] = next_state[(long)g * H + h];
+    state_prev[((long)layer * A + a) * H + h] = scan_h[((long)g * M + M - 1) * H + h];
+    if (last_layer) {
+        out_last[a * H + h] = out[((long)g * M + M - 1) * H + h];
+    }
+}
+
+// Reservoir states from a chunk: res_state[j, s] = state after step s.
+__global__ void t2_reencode_res_kernel(precision_t* __restrict__ res_state,
+        precision_t* __restrict__ res_final, const precision_t* __restrict__ scan_h,
+        const precision_t* __restrict__ next_state, const precision_t* __restrict__ out,
+        const int* __restrict__ ids, const int* __restrict__ lens,
+        int layer, int last_layer, int G, int M, int Lg, int H) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)G * M * H) {
+        return;
+    }
+    int h = idx % H, s = (idx / H) % M, g = idx / ((long)M * H);
+    int len = lens[g];
+    if (s >= len) {
+        return;
+    }
+    long j = ids[g];
+    float v = s + 1 < len ? to_float(scan_h[((long)g * M + M - len + s + 1) * H + h])
+        : to_float(next_state[(long)g * H + h]);
+    res_state[((j * M + s) * Lg + layer) * H + h] = from_float(v);
+    if (last_layer && s == 0) {
+        res_final[j * H + h] = out[((long)g * M + M - 1) * H + h];
+    }
+}
+
+// Encode G records (ids/lens on device) through the scan; outputs stay in the
+// training scan buffers viewed as (G, M).
+static void t2_reencode_chunk(T2* t2, const unsigned char* src_tok, const int* src_act,
+        const int* ids, const int* lens, int G, cudaStream_t stream) {
+    T2Train* tr = &t2->tr;
+    int M = t2->M, H = t2->H, L = t2->L, width = t2->E + t2->EA;
+    long rows = (long)G * M;
+    t2_reencode_gather_kernel<<<grid_size(rows), BLOCK_SIZE, 0, stream>>>(
+        tr->tok_seq.data, tr->act_seq.data, tr->term.data, src_tok, src_act, ids, lens,
+        t2->act_sizes_dev, G, M, L, t2->heads);
+    Prec x_in = {.data = tr->x_in.data, .shape = {rows, width}};
+    Prec x = {.data = tr->x[0].data, .shape = {rows, H}};
+    t2_input_forward(t2, x_in, x, tr->tok_seq.data, tr->act_seq.data, (int)rows, stream);
+    cudaMemsetAsync(tr->init_state.data, 0,
+        (size_t)t2->Lg * G * H * sizeof(precision_t), stream);
+    for (int l = 0; l < t2->Lg; l++) {
+        Prec xl = {.data = tr->x[l].data, .shape = {rows, H}};
+        Prec comb = {.data = tr->combined[l].data, .shape = {rows, 3 * H}};
+        puf_mm(&xl, &t2->w.gru[l], &comb, stream);
+        PrefixScan scan = tr->scan[l];
+        scan.B = G;
+        scan.T = M;
+        scan.combined_ptr = comb.data;
+        scan.state_ptr = tr->init_state.data + (long)l * G * H;
+        scan.input_ptr = xl.data;
+        scan.terminals_ptr = tr->term.data;
+        mingru_scan_forward<<<grid_size(G * H), BLOCK_SIZE, 0, stream>>>(scan);
+        if (l + 1 < t2->Lg) {
+            cudaMemcpyAsync(tr->x[l + 1].data, scan.out.data,
+                rows * H * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
+        }
+    }
+}
+
+void t2_reencode(T2* t2, cudaStream_t stream) {
+    T2Train* tr = &t2->tr;
+    int M = t2->M, H = t2->H, Lg = t2->Lg;
+    int per_chunk = (int)(((long)2 * t2->R * t2->W) / M);
+    int n = t2->A > t2->C ? t2->A : t2->C;
+    int* ids = (int*)malloc(n * sizeof(int));
+    int* lens = (int*)malloc(n * sizeof(int));
+    int* ids_dev = tr->sample_slot.data;    // scratch: sample buffers are idle here
+    int* lens_dev = tr->sample_t.data;
+    assert(per_chunk >= 1 && t2->R >= per_chunk && "re-encode chunk exceeds sample scratch");
+    // Lanes with a complete record (an overflowed record cannot be replayed).
+    int count = 0;
+    for (int a = 0; a < t2->A; a++) {
+        if (t2->host_len[a] > 0 && t2->host_len[a] < M) {
+            ids[count] = a;
+            lens[count] = t2->host_len[a];
+            count++;
+        }
+    }
+    for (int start = 0; start < count; start += per_chunk) {
+        int G = count - start < per_chunk ? count - start : per_chunk;
+        cudaMemcpyAsync(ids_dev, ids + start, G * sizeof(int), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(lens_dev, lens + start, G * sizeof(int), cudaMemcpyHostToDevice, stream);
+        t2_reencode_chunk(t2, t2->ep_tok.data, t2->ep_act.data, ids_dev, lens_dev, G, stream);
+        for (int l = 0; l < Lg; l++) {
+            PrefixScan* sc = &tr->scan[l];
+            t2_reencode_lanes_kernel<<<grid_size(G * H), BLOCK_SIZE, 0, stream>>>(
+                t2->state.data, t2->state_prev.data, t2->out_last.data, sc->scan_h.data,
+                sc->next_state.data, tr->scan[Lg - 1].out.data, ids_dev, l, l == Lg - 1,
+                G, M, t2->A, H);
+        }
+        cudaStreamSynchronize(stream);
+    }
+    count = 0;
+    for (int j = 0; j < t2->C; j++) {
+        if (t2->res_len[j] > 0) {
+            ids[count] = j;
+            lens[count] = t2->res_len[j];
+            count++;
+        }
+    }
+    for (int start = 0; start < count; start += per_chunk) {
+        int G = count - start < per_chunk ? count - start : per_chunk;
+        cudaMemcpyAsync(ids_dev, ids + start, G * sizeof(int), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(lens_dev, lens + start, G * sizeof(int), cudaMemcpyHostToDevice, stream);
+        t2_reencode_chunk(t2, t2->res_tok.data, t2->res_act.data, ids_dev, lens_dev, G, stream);
+        for (int l = 0; l < Lg; l++) {
+            PrefixScan* sc = &tr->scan[l];
+            t2_reencode_res_kernel<<<grid_size((long)G * M * H), BLOCK_SIZE, 0, stream>>>(
+                t2->res_state.data, t2->res_final.data, sc->scan_h.data, sc->next_state.data,
+                tr->scan[Lg - 1].out.data, ids_dev, lens_dev, l, l == Lg - 1, G, M, Lg, H);
+        }
+        cudaStreamSynchronize(stream);
+    }
+    free(ids);
+    free(lens);
+}
+
 void t2_train(PuffeRL* p) {
     T2* t2 = p->t2;
     cudaStream_t stream = p->train_stream;
     double t0 = t2_now();
     for (int s = 0; s < t2->steps; s++) {
         t2_train_step(t2, stream);
+    }
+    if (t2->reencode) {
+        t2_reencode(t2, stream);
     }
     cudaStreamSynchronize(stream);
     assert(cudaGetLastError() == cudaSuccess && "t2 train kernel failed");
@@ -1173,7 +1383,7 @@ static void t2_reg_train(T2* t2) {
     tr->sample_mode = {.shape = {R}};
     tr->sample_partner = {.shape = {R}};
     tr->tok_seq = {.shape = {rows, L}};
-    tr->act_seq = {.shape = {rows}};
+    tr->act_seq = {.shape = {rows, t2->heads}};
     tr->term = {.shape = {2 * R, W}};
     tr->target = {.shape = {R, L}};
     tr->init_state = {.shape = {t2->Lg, 2 * R, H}};
@@ -1193,7 +1403,7 @@ static void t2_reg_train(T2* t2) {
     tr->d_x_in = {.shape = {rows, width}};
     tr->grad_next_state = {.shape = {2 * R, H}};
     tr->tok_embed_grad_i = {.shape = {(long)T2_TOKENS * T2_VOCAB * t2->E}};
-    tr->act_embed_grad_i = {.shape = {(long)(t2->num_actions + 1) * t2->EA}};
+    tr->act_embed_grad_i = {.shape = {(long)t2->act_rows * t2->EA}};
     tr->partials = {.shape = {256}};
     alloc_register(a, &tr->sample_slot);
     alloc_register(a, &tr->sample_t);
@@ -1254,8 +1464,8 @@ static void t2_reg_rollout(T2* t2, T2Rollout* r, int B) {
     r->tok_cur = {.shape = {B, L}};
     r->tok_next = {.shape = {B, L}};
     r->target2 = {.shape = {2 * B, L}};
-    r->act = {.shape = {B}};
-    r->pad = {.shape = {B}};
+    r->act = {.shape = {B, t2->heads}};
+    r->pad = {.shape = {B, t2->heads}};
     r->x_in = {.shape = {3 * B, width}};
     r->x = {.shape = {3 * B, H}};
     r->combined = {.shape = {3 * B, 3 * H}};
@@ -1289,7 +1499,7 @@ static void t2_reg_params(T2* t2) {
     int H = t2->H, D = t2->D;
     int width = t2->E + t2->EA;
     t2->w.tok_embed = {.shape = {(long)T2_TOKENS * T2_VOCAB, t2->E}};
-    t2->w.act_embed = {.shape = {t2->num_actions + 1, t2->EA}};
+    t2->w.act_embed = {.shape = {t2->act_rows, t2->EA}};
     t2->w.w_in = {.shape = {H, width}};
     for (int l = 0; l < t2->Lg; l++) {
         t2->w.gru[l] = {.shape = {3 * H, H}};
@@ -1341,11 +1551,23 @@ int t2_enabled(Ini* ini) {
 T2* t2_create(PuffeRL* p, Ini* ini) {
     assert(PUF_BACKEND == PUF_CPU && "T2 supports CPU env backends");
     assert(p->num_policies == 1 && "T2 requires a single trainable policy");
-    assert(NUM_ATNS == 1 && !p->is_continuous && "T2 requires one discrete action head");
+    assert(!p->is_continuous && "T2 requires discrete action heads");
     VecEnv* vec = p->vec;
     assert(vec->size == vec->total_agents && "T2 requires one agent per env");
     int act_sizes[] = ACT_SIZES;
     T2* t2 = (T2*)calloc(1, sizeof(T2));
+    t2->heads = NUM_ATNS;
+    t2->act_rows = 0;
+    for (int h = 0; h < NUM_ATNS; h++) {
+        t2->act_sizes[h] = act_sizes[h];
+        t2->head_off[h] = t2->act_rows;
+        t2->act_rows += act_sizes[h] + 1;
+    }
+    cudaMalloc((void**)&t2->act_sizes_dev, NUM_ATNS * sizeof(int));
+    cudaMalloc((void**)&t2->head_off_dev, NUM_ATNS * sizeof(int));
+    cudaMemcpy(t2->act_sizes_dev, t2->act_sizes, NUM_ATNS * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(t2->head_off_dev, t2->head_off, NUM_ATNS * sizeof(int), cudaMemcpyHostToDevice);
+    t2->reencode = puf_ini_get(ini, "t2", "reencode") != 0;
     t2->A = vec->total_agents;
     t2->L = T2_TOKENS;
     t2->E = puf_ini_get(ini, "t2", "embed_dim");
@@ -1353,7 +1575,6 @@ T2* t2_create(PuffeRL* p, Ini* ini) {
     t2->H = puf_ini_get(ini, "t2", "hidden_size");
     t2->Lg = puf_ini_get(ini, "t2", "num_layers");
     t2->D = puf_ini_get(ini, "t2", "head_dim");
-    t2->num_actions = act_sizes[0];
     t2->M = puf_ini_get(ini, "t2", "max_episode");
     t2->C = puf_ini_get(ini, "t2", "reservoir");
     t2->R = puf_ini_get(ini, "t2", "wm_batch");
@@ -1420,12 +1641,12 @@ T2* t2_create(PuffeRL* p, Ini* ini) {
     t2->state_prev = {.shape = {Lg, A, H}};
     t2->out_last = {.shape = {A, H}};
     t2->ep_tok = {.shape = {A, M, L}};
-    t2->ep_act = {.shape = {A, M}};
+    t2->ep_act = {.shape = {A, M, t2->heads}};
     t2->ep_state = {.shape = {A, M, Lg, H}};
     t2->ep_len = {.shape = {A}};
     t2->rewards = {.shape = {t2->slots * t2->horizon, A}};
     t2->res_tok = {.shape = {C, M, L}};
-    t2->res_act = {.shape = {C, M}};
+    t2->res_act = {.shape = {C, M, t2->heads}};
     t2->res_state = {.shape = {C, M, Lg, H}};
     t2->res_final = {.shape = {C, H}};
     alloc_register(a, &t2->state);
@@ -1466,16 +1687,23 @@ T2* t2_create(PuffeRL* p, Ini* ini) {
     // Initial observations were produced by env_start; tokenize and stage them.
     t2_encode_tokens(t2, vec->envs, 0, vec->size);
     int B = A / t2->num_buffers;
-    int* pad = (int*)malloc(B * sizeof(int));
+    int* pad = (int*)malloc((size_t)B * t2->heads * sizeof(int));
     for (int i = 0; i < B; i++) {
-        pad[i] = t2->num_actions;
+        for (int h = 0; h < t2->heads; h++) {
+            pad[i * t2->heads + h] = t2->act_sizes[h];
+        }
     }
     for (int b = 0; b < t2->num_buffers; b++) {
         cudaMemcpy(t2->roll[b].tok_cur.data, t2->host_tok + (long)b * B * L,
             (size_t)B * L, cudaMemcpyHostToDevice);
-        cudaMemcpy(t2->roll[b].pad.data, pad, B * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(t2->roll[b].pad.data, pad, (size_t)B * t2->heads * sizeof(int),
+            cudaMemcpyHostToDevice);
     }
     free(pad);
+    if (t2->reencode) {
+        assert((long)2 * t2->R * t2->W >= t2->M
+            && "t2.reencode needs 2 * wm_batch * bptt_window >= max_episode");
+    }
     cudaDeviceSynchronize();
     assert(cudaGetLastError() == cudaSuccess && "t2 create failed");
     return t2;

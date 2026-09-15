@@ -1865,6 +1865,8 @@ struct NethackEncoderWeights {
 };
 
 struct NethackEncoderActivations {
+    Prec* keygrad; // partner train decoder's (B_TT, NH_INV_FLAT), NULL for other instances
+    Prec* spkeygrad; // partner train decoder's spell-key grads, NULL for other instances
     Float glyph_idx, crop_glyph; // decoded grid + crop glyph ids
     Prec e_eff; // materialized E_res + E_kind + E_sub
     Prec x_local; // crop embeds (grad aliases it)
@@ -2188,9 +2190,9 @@ static void nethack_encoder_backward(void* w, void* activations, Prec grad, cuda
 #endif
     // pointer-decoder key grads: second consumer of inv_out, summed before
     // the relu mask (both paths read the post-relu slot vectors)
-    if (nh_ptr_keygrad != NULL)
+    if (a->keygrad != NULL)
         nh_add_inplace_kernel<<<grid_size(B * NH_INV_FLAT), BLOCK_SIZE, 0, stream>>>(
-            a->inv_grad.data, nh_ptr_keygrad->data, B * NH_INV_FLAT);
+            a->inv_grad.data, a->keygrad->data, B * NH_INV_FLAT);
     // attention tail: third consumer of inv_out, also pre-relu-mask
     // no encoder attention under MIN
     nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * NH_INV_FLAT, NH_INV_HID), BLOCK_SIZE, NH_INV_HID * sizeof(long long), stream>>>(
@@ -2283,7 +2285,7 @@ static void nethack_encoder_backward(void* w, void* activations, Prec grad, cuda
       Prec dkf = {.data = a->spk_dkeys.data, .shape = {B * NH_SPELL_SLOTS, NH_SPKEY}};
       puf_mm_nn(&dhf, &ew->spm1_w, &dkf, stream); } // trunk dkeys, FIRST writer
     nh_sp2_dk_kernel<<<grid_size(B * NH_SPELL_SLOTS * NH_SPKEY), BLOCK_SIZE, 0, stream>>>(
-        a->spk_dkeys.data, nh_ptr_spkeygrad != NULL ? nh_ptr_spkeygrad->data : NULL,
+        a->spk_dkeys.data, a->spkeygrad != NULL ? a->spkeygrad->data : NULL,
         a->spk_keys.data, B);
     nh_spkey_dE_kernel<<<grid_size(B * NH_SPELL_SLOTS * NH_EMBED_DIM), BLOCK_SIZE, 0, stream>>>(
         (long long*)a->dE_i.data, a->spk_dkeys.data, ew->spk_w.data, a->spell_idx.data, B);
@@ -3166,6 +3168,8 @@ static void nethack_decoder_reg_train(void* w, void* activations, Allocator* act
     a->enc = nh_enc_last;
     nh_ptr_keygrad = &a->keygrad;
     nh_ptr_spkeygrad = &a->spdk;
+    a->enc->keygrad = &a->keygrad;
+    a->enc->spkeygrad = &a->spdk;
 }
 
 static void nethack_decoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
