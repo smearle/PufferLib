@@ -1,3 +1,11 @@
+## Native intrinsic-reward research branch
+
+[T2, E3B, ICM, RND and E3B × RND: download, build, examples and tests](T2.md).
+Includes Classic Craftax, native NetHack, TriLab and QuadLab environments.
+Start with `bash examples/intrinsic_smoke.sh t2 quadlab` after installing the
+listed CUDA build dependencies. This research port has documented differences
+from the JAX T2 model and does not yet reproduce its QuadLab learning results.
+
 [![Discord](https://dcbadge.limes.pink/api/server/puffer?style=plastic)](https://discord.gg/puffer)
 [![Twitter](https://img.shields.io/twitter/url/https/twitter.com/cloudposse.svg?style=social&label=Follow%20%40jsuarez)](https://twitter.com/jsuarez)
 
